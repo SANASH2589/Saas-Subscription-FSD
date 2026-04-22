@@ -3,178 +3,197 @@ const router = express.Router();
 const supabase = require('../supabaseAdmin');
 const { authenticate } = require('../middleware/authMiddleware');
 
-/**
- * POST /api/v1/auth/signup
- * Creates Supabase auth user → tenant → user_profile
- * First user in tenant = tenant_admin, rest = end_user
- */
-router.post('/signup', async (req, res) => {
+// ==========================================
+// 1. SUPER ADMIN AUTH
+// ==========================================
+
+router.post('/admin/signup', async (req, res) => {
+  const { email, password, full_name } = req.body;
+  const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+    email, password, email_confirm: true
+  });
+  if (authError) return res.status(400).json({ error: authError.message });
+  const authUser = authData.user;
+  
+  const { error: profileError } = await supabase.from('user_profiles').insert([{
+    id: authUser.id,
+    email,
+    full_name: full_name || '',
+    tenant_id: null,
+    role: 'super_admin'
+  }]);
+
+  if (profileError) {
+    await supabase.auth.admin.deleteUser(authUser.id);
+    return res.status(500).json({ error: 'Profile creation failed', details: profileError.message });
+  }
+
+  const { data: loginResult, error: loginError } = await supabase.auth.signInWithPassword({ email, password });
+  if (loginError) return res.status(401).json({ error: loginError.message });
+
+  return res.status(201).json({
+    user: { id: authUser.id, email, full_name: full_name || '', role: 'super_admin' },
+    session: loginResult.session
+  });
+});
+
+router.post('/admin/login', async (req, res) => {
+  const { email, password } = req.body;
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return res.status(401).json({ error: error.message });
+  
+  const { data: profile } = await supabase.from('user_profiles').select('role, full_name').eq('id', data.user.id).single();
+  
+  if (profile?.role !== 'super_admin') {
+    await supabase.auth.admin.signOut(data.session.access_token);
+    return res.status(403).json({ error: 'Access denied: Requires super admin privileges' });
+  }
+  
+  return res.json({
+    user: { id: data.user.id, email: data.user.email, full_name: profile.full_name, role: profile.role },
+    session: data.session
+  });
+});
+
+// ==========================================
+// 2. TENANT ADMIN AUTH
+// ==========================================
+
+router.post('/tenant/signup', async (req, res) => {
   const { email, password, full_name, company_name } = req.body;
 
-  console.time('SignupTotal');
-  
-  // 1. Create User via Admin API (Fastest way to bypass email)
-  console.time('AuthCreate');
   const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true
+    email, password, email_confirm: true
   });
-  console.timeEnd('AuthCreate');
-
   if (authError) return res.status(400).json({ error: authError.message });
   const authUser = authData.user;
 
   try {
-    // 2. Create Tenant & Start parallel tasks
-    console.time('TenantCreate');
-    const slug = `${company_name.toLowerCase().replace(/\s+/g, '-')}-${Date.now().toString(36)}`;
-    const { data: tenant, error: tenantError } = await supabase
-      .from('tenants')
-      .insert([{ name: company_name, slug }])
-      .select()
-      .single();
-    console.timeEnd('TenantCreate');
+    const slug = `${company_name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now().toString(36)}`;
+    const { data: tenant, error: tenantError } = await supabase.from('tenants').insert([{ name: company_name, slug }]).select().single();
+    if (tenantError) throw new Error('Tenant creation failed: ' + tenantError.message);
 
-    if (tenantError) {
-      await supabase.auth.admin.deleteUser(authUser.id);
-      return res.status(500).json({ error: 'Failed to create tenant: ' + tenantError.message });
-    }
+    const planResult = await supabase.from('plans').select('id').eq('name', 'FREE').single();
 
-    // 3. Parallelize Profile creation, Plan lookup, and Login
-    console.time('ParallelTasks');
-    const role = 'tenant_admin';
-
-    // Fetch plan and create profile simultaneously
-    const [planResult, profileResult, loginResult] = await Promise.all([
-      supabase.from('plans').select('id').eq('name', 'FREE').single(),
-      supabase.from('user_profiles').insert([{
-        id: authUser.id,
-        email,
-        full_name: full_name || '',
-        tenant_id: tenant.id,
-        role
-      }]),
+    const [profileResult, loginResult] = await Promise.all([
+      supabase.from('user_profiles').insert([{ id: authUser.id, email, full_name: full_name || '', tenant_id: tenant.id, role: 'tenant_admin' }]),
       supabase.auth.signInWithPassword({ email, password })
     ]);
-    console.timeEnd('ParallelTasks');
 
-    if (profileResult.error) {
-      await supabase.auth.admin.deleteUser(authUser.id);
-      return res.status(500).json({ error: 'Profile creation failed' });
-    }
+    if (profileResult.error) throw new Error('Profile creation failed: ' + profileResult.error.message);
 
-    // 4. Create initial subscription (Background)
     if (planResult.data) {
       const endDate = new Date();
       endDate.setDate(endDate.getDate() + 30);
       await supabase.from('subscriptions').insert([{
-        tenant_id: tenant.id,
-        plan_id: planResult.data.id,
-        status: 'ACTIVE',
-        end_date: endDate.toISOString()
+        tenant_id: tenant.id, plan_id: planResult.data.id, status: 'ACTIVE', end_date: endDate.toISOString()
       }]);
     }
 
-    console.timeEnd('SignupTotal');
-
     return res.status(201).json({
-      user: {
-        id: authUser.id,
-        email,
-        full_name: full_name || '',
-        role,
-        tenant_id: tenant.id,
-        tenant_name: tenant.name
-      },
-      session: loginResult.data?.session || null
+      user: { id: authUser.id, email, full_name: full_name || '', role: 'tenant_admin', tenant_id: tenant.id, tenant_name: tenant.name, tenant_slug: tenant.slug },
+      session: loginResult.data.session
     });
   } catch (err) {
-    console.error('Signup error:', err);
-    return res.status(500).json({ error: 'Critical error during signup' });
+    await supabase.auth.admin.deleteUser(authUser.id);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/v1/auth/login
- * Authenticates and returns session + enriched user profile
- */
-router.post('/login', async (req, res) => {
+router.post('/tenant/login', async (req, res) => {
   const { email, password } = req.body;
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return res.status(401).json({ error: error.message });
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'email and password are required' });
+  const { data: profile } = await supabase.from('user_profiles').select('role, tenant_id, full_name, tenants(name, slug)').eq('id', data.user.id).single();
+
+  if (profile?.role !== 'tenant_admin') {
+    await supabase.auth.admin.signOut(data.session.access_token);
+    return res.status(403).json({ error: 'Access denied: Requires tenant admin privileges' });
   }
-
-  console.log(`Attempting login for: ${email}`);
-
-  // OPTIMIZATION: Start auth and profile fetch in parallel
-  const [authPromise, profilePromise] = [
-    supabase.auth.signInWithPassword({ email, password }),
-    supabase
-      .from('user_profiles')
-      .select('role, tenant_id, full_name, tenants(name)')
-      .eq('email', email)
-      .maybeSingle()
-  ];
-
-  console.log('Auth and Profile fetch started...');
-  const { data: sessionData, error: sessionError } = await authPromise;
-  console.log('Auth request completed.');
-
-  if (sessionError) {
-    console.log(`Auth failed: ${sessionError.message}`);
-    return res.status(401).json({ error: sessionError.message });
-  }
-
-  console.log('Checking profile...');
-  const { data: profile, error: profileError } = await profilePromise;
-  console.log('Profile check completed.');
-
-  if (profileError || !profile) {
-    console.log('Profile not found or error occurred.');
-    return res.status(500).json({ error: 'User authenticated but profile not found' });
-  }
-
-  const authUser = sessionData.user;
-  console.log(`Login successful for ${email}`);
 
   return res.json({
-    user: {
-      id: authUser.id,
-      email: authUser.email,
-      full_name: profile.full_name,
-      role: profile.role,
-      tenant_id: profile.tenant_id,
-      tenant_name: profile.tenants?.name || ''
-    },
-    session: sessionData.session
+    user: { id: data.user.id, email: data.user.email, full_name: profile.full_name, role: profile.role, tenant_id: profile.tenant_id, tenant_name: profile.tenants?.name, tenant_slug: profile.tenants?.slug },
+    session: data.session
   });
 });
 
-/**
- * GET /api/v1/auth/me
- * Returns the authenticated user's full profile + subscription info
- */
+// ==========================================
+// 3. END USER AUTH
+// ==========================================
+
+router.post('/user/signup', async (req, res) => {
+  const { email, password, full_name, tenant_slug } = req.body;
+  if (!tenant_slug) return res.status(400).json({ error: 'tenant_slug is required' });
+
+  const { data: tenant, error: tenantError } = await supabase.from('tenants').select('id, name').eq('slug', tenant_slug).single();
+  if (tenantError || !tenant) return res.status(404).json({ error: 'Tenant not found with provided slug' });
+
+  const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+    email, password, email_confirm: true
+  });
+  if (authError) return res.status(400).json({ error: authError.message });
+  const authUser = authData.user;
+
+  const { error: profileError } = await supabase.from('user_profiles').insert([{
+    id: authUser.id, email, full_name: full_name || '', tenant_id: tenant.id, role: 'end_user'
+  }]);
+
+  if (profileError) {
+    await supabase.auth.admin.deleteUser(authUser.id);
+    return res.status(500).json({ error: 'Profile creation failed: ' + profileError.message });
+  }
+
+  const { data: loginResult } = await supabase.auth.signInWithPassword({ email, password });
+
+  return res.status(201).json({
+    user: { id: authUser.id, email, full_name: full_name || '', role: 'end_user', tenant_id: tenant.id, tenant_name: tenant.name },
+    session: loginResult.session
+  });
+});
+
+router.post('/user/login', async (req, res) => {
+  const { email, password } = req.body;
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return res.status(401).json({ error: error.message });
+
+  const { data: profile } = await supabase.from('user_profiles').select('role, tenant_id, full_name, tenants(name, slug)').eq('id', data.user.id).single();
+
+  if (profile?.role !== 'end_user') {
+    await supabase.auth.admin.signOut(data.session.access_token);
+    return res.status(403).json({ error: 'Access denied: Requires end user privileges' });
+  }
+
+  return res.json({
+    user: { id: data.user.id, email: data.user.email, full_name: profile.full_name, role: profile.role, tenant_id: profile.tenant_id, tenant_name: profile.tenants?.name, tenant_slug: profile.tenants?.slug },
+    session: data.session
+  });
+});
+
+// ==========================================
+// SHARED ROUTES (/me, /logout)
+// ==========================================
+
 router.get('/me', authenticate, async (req, res) => {
   try {
-    // Parallelize Profile and Active subscription lookup
-    const [profileResult, subscriptionResult] = await Promise.all([
-      supabase
-        .from('user_profiles')
-        .select('role, tenant_id, full_name, email, created_at, tenants(id, name)')
-        .eq('id', req.user.id)
-        .single(),
-      supabase
+    const { data: profile } = await supabase
+      .from('user_profiles')
+      .select('role, tenant_id, full_name, email, created_at, tenants(id, name, slug)')
+      .eq('id', req.user.id)
+      .single();
+
+    let subscription = null;
+    if (profile?.tenant_id) {
+      const { data: sub } = await supabase
         .from('subscriptions')
         .select('id, status, start_date, end_date, plans(id, name, description, price, interval, feature_limits)')
-        .eq('tenant_id', req.user.tenant_id)
+        .eq('tenant_id', profile.tenant_id)
         .eq('status', 'ACTIVE')
-        .maybeSingle()
-    ]);
-
-    const profile = profileResult.data;
-    const subscription = subscriptionResult.data;
+        .maybeSingle();
+      if (sub) subscription = {
+        id: sub.id, status: sub.status, start_date: sub.start_date, end_date: sub.end_date, plan: sub.plans
+      };
+    }
 
     return res.json({
       user: {
@@ -184,30 +203,24 @@ router.get('/me', authenticate, async (req, res) => {
         role: profile?.role || req.user.role,
         tenant_id: profile?.tenant_id,
         tenant_name: profile?.tenants?.name || '',
+        tenant_slug: profile?.tenants?.slug || '',
         created_at: profile?.created_at
       },
-      subscription: subscription ? {
-        id: subscription.id,
-        status: subscription.status,
-        start_date: subscription.start_date,
-        end_date: subscription.end_date,
-        plan: subscription.plans
-      } : null
+      subscription
     });
   } catch (err) {
-    console.error('Me route error:', err);
     return res.status(500).json({ error: 'Failed to fetch user data' });
   }
 });
 
-/**
- * POST /api/v1/auth/logout
- * Signs the user out (invalidates session server-side)
- */
 router.post('/logout', authenticate, async (req, res) => {
-  const token = req.headers.authorization.split(' ')[1];
-  await supabase.auth.admin.signOut(token);
-  return res.json({ message: 'Logged out successfully' });
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) await supabase.auth.admin.signOut(token);
+    return res.json({ message: 'Logged out successfully' });
+  } catch(err) {
+    return res.status(500).json({ error: 'Logout failed' });
+  }
 });
 
 module.exports = router;
