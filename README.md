@@ -81,14 +81,14 @@ tenants ──< api_keys
 
 <div align="center">
  
-ENTITLEMENT PLATFORM
+<h2>ENTITLEMENT PLATFORM</h2>
 <img width="500" height="270" alt="image" src="https://github.com/user-attachments/assets/60891eac-a194-41ed-8bf6-2f46e0f0e4bf" />
 </div>
 
 <br>
 
 <div align="center">
-DEMO PAGE
+<h2>DEMO PAGE</h2>
 <img width="500" height="270" alt="image" src="https://github.com/user-attachments/assets/e4a14d7f-1b63-424a-a064-22c48b0ea05c" />
 </div>
 
