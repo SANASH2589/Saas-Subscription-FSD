@@ -1,4 +1,11 @@
 const supabase = require('../supabaseAdmin');
+const { createClient } = require('@supabase/supabase-js');
+
+const supabaseAuthClient = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
 
 /**
  * authenticate — Validates the Bearer JWT from the Authorization header.
@@ -26,7 +33,7 @@ async function authenticate(req, res, next) {
 
     // Start verification and profile fetch simultaneously
     const [authResult, profileResult] = await Promise.all([
-      supabase.auth.getUser(token),
+      supabaseAuthClient.auth.getUser(token),
       supabase
         .from('user_profiles')
         .select('role, tenant_id')
@@ -53,6 +60,8 @@ async function authenticate(req, res, next) {
       tenantId: profile?.tenant_id || null
     };
 
+    console.log(`[Auth] Authenticated user: ${req.user.email} | Role: ${req.user.role} | Tenant: ${req.user.tenantId}`);
+
     next();
   } catch (err) {
     console.error('Auth middleware error:', err);
@@ -70,6 +79,7 @@ function requireRole(...allowedRoles) {
       return res.status(401).json({ error: 'Not authenticated' });
     }
     if (!allowedRoles.includes(req.user.role)) {
+      console.log(`[Auth] Access Denied for ${req.url}: Required roles: ${allowedRoles.join(', ')}. User role: ${req.user.role}`);
       return res.status(403).json({
         error: `Access denied. Required roles: ${allowedRoles.join(', ')}. Your role: ${req.user.role}`
       });
@@ -78,4 +88,20 @@ function requireRole(...allowedRoles) {
   };
 }
 
-module.exports = { authenticate, requireRole };
+/**
+ * requireSuperAdmin — Specific middleware for super admin routes.
+ */
+function requireSuperAdmin(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  if (req.user.role !== 'super_admin') {
+    console.log(`[Auth] Super Admin Access Denied for ${req.url}: User role is ${req.user.role}`);
+    return res.status(403).json({
+      error: 'Access denied. Super admin privileges required.'
+    });
+  }
+  next();
+}
+
+module.exports = { authenticate, requireRole, requireSuperAdmin };

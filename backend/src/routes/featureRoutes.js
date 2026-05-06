@@ -3,10 +3,12 @@ const router = express.Router();
 const supabase = require('../supabaseAdmin');
 const { authenticate, requireRole } = require('../middleware/authMiddleware');
 
+const { apiKeyAuth } = require('../middleware/apiKeyAuth');
+
 /**
- * GET /api/features
+ * GET /api/v1/features
  */
-router.get('/', authenticate, async (req, res) => {
+router.get('/', apiKeyAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('features')

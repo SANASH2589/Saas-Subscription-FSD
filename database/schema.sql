@@ -28,6 +28,20 @@ CREATE TABLE tenants (
 );
 
 -- ============================================================
+-- 1.5. API KEYS (Multi-Key Support)
+-- ============================================================
+CREATE TABLE api_keys (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  key_hash      TEXT NOT NULL UNIQUE,
+  name          TEXT NOT NULL DEFAULT 'Default Key',
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  last_used_at  TIMESTAMPTZ
+);
+
+
+-- ============================================================
 -- 2. USER PROFILES
 -- ============================================================
 CREATE TABLE user_profiles (
@@ -71,30 +85,29 @@ CREATE TABLE plans (
   updated_at      TIMESTAMPTZ DEFAULT now()
 );
 
--- ============================================================
--- 5. SUBSCRIPTIONS
--- ============================================================
 CREATE TABLE subscriptions (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id   UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  plan_id     UUID NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
-  status      TEXT NOT NULL DEFAULT 'ACTIVE'
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id        UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  external_user_id TEXT, -- Optional: if NULL, it means the subscription is for the tenant itself. If provided, it's for an end-user.
+  plan_id          UUID NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
+  status           TEXT NOT NULL DEFAULT 'ACTIVE'
                 CHECK (status IN ('ACTIVE', 'CANCELLED', 'EXPIRED')),
-  start_date  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  end_date    TIMESTAMPTZ,
-  created_at  TIMESTAMPTZ DEFAULT now(),
-  updated_at  TIMESTAMPTZ DEFAULT now()
+  start_date       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  end_date         TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ DEFAULT now(),
+  updated_at       TIMESTAMPTZ DEFAULT now()
 );
 
 -- ============================================================
 -- 6. USAGE EVENTS
 -- ============================================================
 CREATE TABLE usage_events (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id       UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  feature_code  TEXT NOT NULL,
-  created_at    TIMESTAMPTZ DEFAULT now()
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id         UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  external_user_id  TEXT NOT NULL,
+  feature_code      TEXT NOT NULL,
+  count             INTEGER NOT NULL DEFAULT 1,
+  created_at        TIMESTAMPTZ DEFAULT now()
 );
 
 -- ============================================================
@@ -105,6 +118,8 @@ CREATE INDEX idx_subscriptions_tenant ON subscriptions(tenant_id);
 CREATE INDEX idx_subscriptions_status ON subscriptions(status);
 CREATE INDEX idx_usage_events_tenant_feature ON usage_events(tenant_id, feature_code);
 CREATE INDEX idx_usage_events_created ON usage_events(created_at);
+CREATE INDEX idx_api_keys_tenant ON api_keys(tenant_id);
+CREATE INDEX idx_api_keys_hash ON api_keys(key_hash);
 
 -- ============================================================
 -- ROW LEVEL SECURITY (RLS)
@@ -117,6 +132,7 @@ ALTER TABLE features         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE plans            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subscriptions    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_events     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_keys         ENABLE ROW LEVEL SECURITY;
 
 -- Allow read-only access to plans and features for authenticated users
 CREATE POLICY "plans_read" ON plans FOR SELECT TO authenticated USING (true);
@@ -125,16 +141,6 @@ CREATE POLICY "features_read" ON features FOR SELECT TO authenticated USING (tru
 -- Users can read their own profile
 CREATE POLICY "own_profile_read" ON user_profiles FOR SELECT TO authenticated
   USING (auth.uid() = id);
-
--- Users can read their tenant's subscription
-CREATE POLICY "tenant_subscription_read" ON subscriptions FOR SELECT TO authenticated
-  USING (tenant_id IN (
-    SELECT tenant_id FROM user_profiles WHERE id = auth.uid()
-  ));
-
--- Users can read their own usage events
-CREATE POLICY "own_usage_read" ON usage_events FOR SELECT TO authenticated
-  USING (user_id = auth.uid());
 
 -- ============================================================
 -- SEED: Default Plans

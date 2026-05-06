@@ -2,11 +2,12 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../supabaseAdmin');
 const { authenticate, requireRole } = require('../middleware/authMiddleware');
+const { apiKeyAuth } = require('../middleware/apiKeyAuth');
 
 /**
- * GET /api/plans
+ * GET /api/v1/plans
  */
-router.get('/', authenticate, async (req, res) => {
+router.get('/', apiKeyAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('plans')
@@ -21,9 +22,9 @@ router.get('/', authenticate, async (req, res) => {
 });
 
 /**
- * GET /api/plans/:id
+ * GET /api/v1/plans/:id
  */
-router.get('/:id', authenticate, async (req, res) => {
+router.get('/:id', apiKeyAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('plans')

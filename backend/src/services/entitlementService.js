@@ -2,122 +2,144 @@ const supabase = require('../supabaseAdmin');
 
 /**
  * checkAccess — Core entitlement engine.
- * Returns { allowed, message, currentUsage, limit, plan_name }
+ * Returns { allowed, reason, remaining, limit, plan }
  */
-async function checkAccess(userId, featureCode) {
+async function checkAccess(tenantId, externalUserId, featureCode) {
   try {
-    // 1. Get user profile → tenant_id
-    const { data: profile, error: profileErr } = await supabase
-      .from('user_profiles')
-      .select('tenant_id')
-      .eq('id', userId)
-      .maybeSingle();
-
-    if (profileErr || !profile) {
-      return { allowed: false, message: 'User profile not found', currentUsage: 0, limit: 0, plan_name: null };
-    }
-
-    const tenantId = profile.tenant_id;
-
-    // 2. Check global feature is enabled
-    const { data: feature, error: featureErr } = await supabase
-      .from('features')
-      .select('is_enabled, usage_tracked')
-      .eq('code', featureCode)
-      .maybeSingle();
-
-    if (featureErr || !feature) {
-      return { allowed: false, message: `Feature "${featureCode}" does not exist`, currentUsage: 0, limit: 0, plan_name: null };
-    }
-
-    if (!feature.is_enabled) {
-      return { allowed: false, message: 'Feature is globally disabled', currentUsage: 0, limit: 0, plan_name: null };
-    }
-
-    // 3. Get active subscription → plan
-    const { data: sub, error: subErr } = await supabase
+    // 1. Identify active subscription
+    let { data: subData, error: subErr } = await supabase
       .from('subscriptions')
-      .select('plan_id, end_date, plans(name, feature_limits)')
+      .select('plan_id, status, end_date, plans(name)')
       .eq('tenant_id', tenantId)
+      .eq('external_user_id', externalUserId)
       .eq('status', 'ACTIVE')
-      .maybeSingle();
+      .limit(1);
+
+    const sub = subData?.[0];
 
     if (subErr || !sub) {
-      return { allowed: false, message: 'No active subscription found', currentUsage: 0, limit: 0, plan_name: null };
+      console.log(`[ENTITLEMENT] No active subscription for tenant=${tenantId}, user=${externalUserId}`);
+      return {
+        success: false, allowed: false, feature: featureCode, plan: null,
+        used: 0, limit: 0, remaining: 0, reason: 'no_active_subscription'
+      };
     }
 
-    if (sub.end_date && new Date(sub.end_date) < new Date()) {
-      // Auto-expire
-      await supabase.from('subscriptions').update({ status: 'EXPIRED' }).eq('plan_id', sub.plan_id).eq('tenant_id', tenantId);
-      return { allowed: false, message: 'Subscription has expired', currentUsage: 0, limit: 0, plan_name: sub.plans?.name };
+    const planId = sub.plan_id;
+    const planName = sub.plans?.name || planId;
+
+    console.log(`[ENTITLEMENT] Found subscription: plan=${planName} (${planId}), user=${externalUserId}`);
+
+    // 2. Get feature limit from plan_features
+    const { data: pfData, error: pfErr } = await supabase
+      .from('plan_features')
+      .select('limit_value')
+      .eq('plan_id', planId)
+      .eq('feature_code', featureCode)
+      .limit(1);
+
+    const planFeature = pfData?.[0];
+
+    console.log(`[ENTITLEMENT] plan_features lookup: plan_id=${planId}, feature_code=${featureCode}, result=`, planFeature || 'NOT FOUND');
+
+    if (pfErr) {
+      console.error(`[ENTITLEMENT] plan_features query error:`, pfErr);
     }
 
-    const plan = sub.plans;
-    const limits = plan?.feature_limits || {};
-    const planName = plan?.name;
+    // 3. If no plan_features row found, fall back to plans.feature_limits JSON
+    let limit;
+    if (planFeature) {
+      limit = planFeature.limit_value;
+    } else {
+      // Fallback: read from the plans.feature_limits JSONB column
+      const { data: planData } = await supabase
+        .from('plans')
+        .select('feature_limits')
+        .eq('id', planId)
+        .single();
 
-    if (!(featureCode in limits)) {
-      return { allowed: false, message: `Feature not included in the ${planName} plan`, currentUsage: 0, limit: 0, plan_name: planName };
+      const featureLimits = planData?.feature_limits || {};
+      // Try exact match, then uppercase version (schema seeds use EXPORT_PDF etc)
+      const jsonLimit = featureLimits[featureCode]
+        ?? featureLimits[featureCode.toUpperCase()]
+        ?? featureLimits[featureCode.toUpperCase().replace(/ /g, '_')];
+
+      console.log(`[ENTITLEMENT] Fallback to plans.feature_limits:`, featureLimits, `=> ${featureCode} = ${jsonLimit}`);
+
+      if (jsonLimit === undefined || jsonLimit === null) {
+        return {
+          success: false, allowed: false, feature: featureCode, plan: planName,
+          used: 0, limit: 0, remaining: 0, reason: 'feature_not_in_plan'
+        };
+      }
+      limit = jsonLimit;
     }
 
-    const limit = limits[featureCode];
-
-    // limit = 0 → disabled in this plan
     if (limit === 0) {
-      return { allowed: false, message: `This feature requires a plan upgrade`, currentUsage: 0, limit: 0, plan_name: planName };
+      return {
+        success: true, allowed: false, feature: featureCode, plan: planName,
+        used: 0, limit: 0, remaining: 0, reason: 'feature_disabled_in_plan'
+      };
     }
 
-    // limit = -1 → unlimited
-    if (limit === -1) {
-      return { allowed: true, message: 'Access granted (unlimited)', currentUsage: 0, limit: -1, plan_name: planName };
-    }
-
-    // 4. Check monthly usage count
+    // 4. Count usage_events for this month
     const startOfMonth = new Date();
     startOfMonth.setDate(1);
     startOfMonth.setHours(0, 0, 0, 0);
 
-    const { count, error: countErr } = await supabase
+    const { data: usageData, error: countErr } = await supabase
       .from('usage_events')
-      .select('*', { count: 'exact', head: true })
+      .select('count')
       .eq('tenant_id', tenantId)
+      .eq('external_user_id', externalUserId)
       .eq('feature_code', featureCode)
       .gte('created_at', startOfMonth.toISOString());
 
     if (countErr) throw countErr;
 
-    const currentUsage = count || 0;
+    const used = usageData.reduce((acc, row) => acc + (row.count || 1), 0);
 
-    if (currentUsage >= limit) {
+    if (limit === -1) {
       return {
-        allowed: false,
-        message: `Monthly usage limit reached (${currentUsage}/${limit})`,
-        currentUsage,
-        limit,
-        plan_name: planName
+        success: true, allowed: true, feature: featureCode, plan: planName,
+        used, limit: -1, remaining: -1
+      };
+    }
+
+    const remaining = Math.max(0, limit - used);
+
+    if (used >= limit) {
+      return {
+        success: true, allowed: false, feature: featureCode, plan: planName,
+        used, limit, remaining: 0, reason: 'limit_exceeded'
       };
     }
 
     return {
-      allowed: true,
-      message: `Access granted (${currentUsage}/${limit} used this month)`,
-      currentUsage,
-      limit,
-      plan_name: planName
+      success: true, allowed: true, feature: featureCode, plan: planName,
+      used, limit, remaining
     };
   } catch (error) {
-    console.error('checkAccess error:', error);
-    return { allowed: false, message: 'Internal error during access check', currentUsage: 0, limit: 0, plan_name: null };
+    console.error('[ENTITLEMENT] checkAccess error:', error);
+    return {
+      success: false, allowed: false, feature: featureCode, plan: null,
+      used: 0, limit: 0, remaining: 0, reason: 'internal_error'
+    };
   }
 }
 
 /**
- * trackUsage — Inserts a usage event.
+ * trackUsage — Inserts a usage event for an external user.
  */
-async function trackUsage(userId, tenantId, featureCode) {
+async function trackUsage(tenantId, externalUserId, featureCode, count = 1) {
   const { error } = await supabase
     .from('usage_events')
-    .insert([{ user_id: userId, tenant_id: tenantId, feature_code: featureCode }]);
+    .insert([{
+      tenant_id: tenantId,
+      external_user_id: externalUserId,
+      feature_code: featureCode,
+      count: count
+    }]);
 
   if (error) {
     console.error('trackUsage error:', error);
