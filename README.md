@@ -77,7 +77,20 @@ tenants ──< api_keys
 
 > `-1` = unlimited · `0` = disabled · `N` = N uses/month
 
----
+
+
+<div align="center">
+ 
+ENTITLEMENT PLATFORM
+<img width="500" height="270" alt="image" src="https://github.com/user-attachments/assets/60891eac-a194-41ed-8bf6-2f46e0f0e4bf" />
+</div>
+
+<br>
+
+<div align="center">
+DEMO PAGE
+<img width="500" height="270" alt="image" src="https://github.com/user-attachments/assets/e4a14d7f-1b63-424a-a064-22c48b0ea05c" />
+</div>
 
 
 <div align="center">
